@@ -22,3 +22,4 @@ build/
 *.log
 npm-debug.log*
 .vercel
+.freebuff/
