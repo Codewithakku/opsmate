@@ -1,0 +1,35 @@
+# Caddyfile — single-origin entrypoint for OpsMate (Docker only)
+# Everything (frontend UI + backend API + WebSocket) is served from ONE host
+# port: 3001. Containers keep their internal ports (frontend 5173, backend 5000).
+#
+# IMPORTANT: the frontend owns /api/search and /api/assist (Next route handlers),
+# so Caddy only forwards the Express backend's SPECIFIC routes — a blanket
+# /api/* rule would shadow the frontend's own handlers.
+
+:3001 {
+    # ---- Express backend (specific routes only) ----
+    handle /api/health {
+        reverse_proxy backend:5000
+    }
+    handle /api/classify {
+        reverse_proxy backend:5000
+    }
+    handle /api/test-order {
+        reverse_proxy backend:5000
+    }
+    # Express search exposed under an alias — the frontend keeps /api/search itself.
+    handle /api/backend-search {
+        uri replace /api/backend-search /api/search
+        reverse_proxy backend:5000
+    }
+
+    # ---- Backend WebSocket (NEXT_PUBLIC_WS_URL=ws://localhost:3001/ws) ----
+    handle /ws {
+        reverse_proxy backend:5000
+    }
+
+    # ---- Everything else (UI, /_next/*, /api/search, /api/assist) ----
+    handle {
+        reverse_proxy frontend:5173
+    }
+}
