@@ -71,7 +71,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16   # postgres:16 + pgvector pre-installed
 
     environment:
       POSTGRES_DB: opsmate

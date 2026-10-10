@@ -23,3 +23,8 @@ build/
 npm-debug.log*
 .vercel
 .freebuff/
+
+# backend backup and logs
+backend/.env.bak.migrate
+backend/logs/
+backend/.env*

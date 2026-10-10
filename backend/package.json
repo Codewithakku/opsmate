@@ -1,28 +1,22 @@
 {
   "name": "opsmate-backend",
   "version": "1.0.0",
-  "description": "OpsMate Express API — Gemini + Supabase + WebSocket",
+  "description": "OpsMate Express API — Ollama + PostgreSQL cache + WebSocket",
   "main": "server.js",
   "scripts": {
     "dev": "node --watch server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@ai-sdk/google": "^4.0.86",
-    "@ai-sdk/openai": "^4.0.83",
-    "@supabase/supabase-js": "^2.49.1",
-    "@upstash/redis": "^1.39.0",
-    "@upstash/vector": "^1.2.3",
-    "ai": "^4.3.19",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.2.1",
     "ollama": "^0.6.4",
-    "ollama-ai-provider": "^1.2.0",
     "pg": "^8.23.0",
     "ws": "^8.18.0",
     "zod": "^4.6.5"

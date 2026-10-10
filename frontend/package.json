@@ -13,10 +13,6 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^4.0.62",
-    "@ai-sdk/openai": "^4.0.74",
-    "@upstash/vector": "^1.2.3",
-    "ai": "^7.0.113",
     "next": "^16.3.6",
     "react": "19.2.8",
     "react-dom": "19.2.8"

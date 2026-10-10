@@ -17,70 +17,18 @@ interface ChatMessage {
   content: string;
 }
 
-/** Cache status reported by the /api/assist response headers. */
 interface CacheInfo {
-  layer: string; // HIT | MISS | COALESCED | L1_MEMORY | L2_REDIS | L3_SEMANTIC ...
+  layer: string; // raw X-Cache value: "HIT" | "MISS" | "BYPASS"
+  provider: string; // raw X-Provider value: SMALLTALK | ORDER_DB | CACHE | SEMANTIC_CACHE | ollama
   hit: boolean;
-  tool: string | null; // e.g. "order-lookup" when the backend ran a tool call
+  tool: string | null;
 }
 
-/** Latency reported by Server-Timing + measured in the browser. */
 interface LatencyInfo {
-  firstTokenMs: number | null; // server: time to first streamed token
-  serverMs: number | null; // server: total time (instant answers)
-  totalMs: number; // browser: full round trip
+  firstTokenMs: number | null;
+  serverMs: number | null;
+  totalMs: number;
 }
-
-interface CacheCounters {
-  hits: number;
-  misses: number;
-}
-
-// ============================================================
-// Cache / latency presentation
-// ============================================================
-
-const CACHE_LAYER_LABELS: Record<string, string> = {
-  HIT: "answer cache",
-  MISS: "live model",
-  COALESCED: "shared in-flight",
-  L1_MEMORY: "L1 memory",
-  L2_REDIS: "L2 Redis",
-  L3_SEMANTIC: "L3 semantic",
-  BACKEND: "backend",
-  BYPASS: "bypassed · live data",
-};
-
-const MISS_LAYERS = new Set(["MISS", "BYPASS", ""]);
-
-const isCacheHit = (layer: string) => !MISS_LAYERS.has(layer);
-
-const cacheLayerLabel = (layer: string) => CACHE_LAYER_LABELS[layer] ?? layer;
-
-function latencyText(latency: LatencyInfo): string {
-  if (latency.firstTokenMs !== null) {
-    return `first token ${latency.firstTokenMs}ms · total ${latency.totalMs}ms`;
-  }
-  if (latency.serverMs !== null) {
-    return `answered in ${latency.serverMs}ms`;
-  }
-  return `total ${latency.totalMs}ms`;
-}
-
-function parseServerTiming(header: string | null): Record<string, number> {
-  const out: Record<string, number> = {};
-  if (!header) return out;
-
-  for (const part of header.split(",")) {
-    const match = part.trim().match(/^([\w-]+);dur=([\d.]+)$/);
-    if (match) out[match[1]] = Number(match[2]);
-  }
-  return out;
-}
-
-// ============================================================
-// Error presentation — specific, actionable messages only
-// ============================================================
 
 interface ErrorInfo {
   icon: string;
@@ -88,11 +36,82 @@ interface ErrorInfo {
   body: string;
 }
 
-/** Pulls a human message out of a JSON (or plain text) error body. */
+interface ActiveRequest {
+  id: number;
+  controller: AbortController;
+  reader: ReadableStreamDefaultReader<Uint8Array> | null;
+  cancelled: boolean;
+}
+
+const MAX_HISTORY_MESSAGES = 3;
+const MAX_HISTORY_ITEMS = MAX_HISTORY_MESSAGES * 2;
+
+// ============================================================
+// Cache / latency presentation
+//
+// This backend has no in-memory / L1 cache and no multi-tier
+// (L2 Postgres / L2 Redis / L3 semantic / coalesced) setup — it
+// is DB-only caching plus a deterministic small-talk layer and a
+// live order lookup. The badge below is built directly from the
+// X-Provider header the backend actually sends, so it can never
+// drift out of sync with reality again.
+// ============================================================
+
+const PROVIDER_LABELS: Record<string, string> = {
+  SMALLTALK: "small talk",
+  ORDER_DB: "live order lookup",
+  CACHE: "database cache",
+  SEMANTIC_CACHE: "semantic cache (Postgres)",
+  ollama: "live model",
+};
+
+const MISS_LAYERS = new Set(["MISS", "BYPASS", ""]);
+
+const isCacheHit = (layer: string) => !MISS_LAYERS.has(layer);
+
+const cacheProviderLabel = (provider: string) =>
+  PROVIDER_LABELS[provider] ?? provider;
+
+function latencyText(latency: LatencyInfo): string {
+  if (latency.firstTokenMs !== null) {
+    return `first token ${latency.firstTokenMs}ms · total ${latency.totalMs}ms`;
+  }
+
+  if (latency.serverMs !== null) {
+    return `answered in ${latency.serverMs}ms`;
+  }
+
+  return `total ${latency.totalMs}ms`;
+}
+
+function parseServerTiming(
+  header: string | null
+): Record<string, number> {
+  const out: Record<string, number> = {};
+
+  if (!header) return out;
+
+  for (const part of header.split(",")) {
+    const match = part.trim().match(/^([\w-]+);dur=([\d.]+)$/);
+
+    if (match) {
+      out[match[1]] = Number(match[2]);
+    }
+  }
+
+  return out;
+}
+
+// ============================================================
+// Error presentation
+// ============================================================
+
 function extractErrorMessage(raw: string): string {
   try {
     const parsed = JSON.parse(raw);
+
     if (typeof parsed === "string") return parsed;
+
     return parsed?.message || parsed?.error || raw;
   } catch {
     return raw;
@@ -106,18 +125,17 @@ function creditError(): ErrorInfo {
   return {
     icon: "💳",
     title: "AI Credit Limit Reached",
-    body: "You've reached your AI credit limit. Add credits to the AI provider account (or switch AI_PROVIDER to a provider with credits), then try again.",
+    body: "You've reached your AI credit limit. Add credits to the AI provider account or switch to a provider with available credits, then try again.",
   };
 }
 
 function parseErrorInfo(raw: string): ErrorInfo {
   const msg = raw.toLowerCase();
 
-  // 1. Credit / quota exhaustion — always checked first so a billing problem
-  //    is never mislabelled as a rate limit (providers send both as 429).
-  if (CREDIT_ERROR_RE.test(msg)) return creditError();
+  if (CREDIT_ERROR_RE.test(msg)) {
+    return creditError();
+  }
 
-  // 2. Every provider failed — the body already lists per-provider reasons.
   if (PROVIDER_LIST_RE.test(raw)) {
     const reasons = raw
       .replace(PROVIDER_LIST_RE, "")
@@ -129,8 +147,10 @@ function parseErrorInfo(raw: string): ErrorInfo {
       .filter((line) => line.trim().startsWith("•"))
       .map((line) => line.replace(/^[\s•]+/, "").trim());
 
-    // If every provider failed for the same billing reason, say that plainly.
-    if (bullets.length > 0 && bullets.every((b) => CREDIT_ERROR_RE.test(b.toLowerCase()))) {
+    if (
+      bullets.length > 0 &&
+      bullets.every((item) => CREDIT_ERROR_RE.test(item))
+    ) {
       return creditError();
     }
 
@@ -141,16 +161,18 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 3. Rate limiting
-  if (msg.includes("rate limit") || msg.includes("too many requests") || msg.includes("429")) {
+  if (
+    msg.includes("rate limit") ||
+    msg.includes("too many requests") ||
+    msg.includes("429")
+  ) {
     return {
       icon: "⏳",
       title: "Too Many Requests",
-      body: "The AI service is receiving too many requests right now. Wait a moment, then try again.",
+      body: "The AI service is receiving too many requests. Wait a moment, then try again.",
     };
   }
 
-  // 4. API key / authentication
   if (
     msg.includes("api key") ||
     msg.includes("authentication") ||
@@ -166,8 +188,11 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 5. Timeout
-  if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("etimedout")) {
+  if (
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("etimedout")
+  ) {
     return {
       icon: "⌛",
       title: "Request Timed Out",
@@ -175,7 +200,6 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 6. Network / connection
   if (
     msg.includes("network") ||
     msg.includes("fetch") ||
@@ -189,7 +213,6 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 7. Server-side problems
   if (
     msg.includes("500") ||
     msg.includes("502") ||
@@ -207,8 +230,10 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 8. Empty input
-  if (msg.includes("please type a question") || msg.includes("please enter a question")) {
+  if (
+    msg.includes("please type a question") ||
+    msg.includes("please enter a question")
+  ) {
     return {
       icon: "✏️",
       title: "Empty Question",
@@ -216,7 +241,6 @@ function parseErrorInfo(raw: string): ErrorInfo {
     };
   }
 
-  // 9. Fallback — still readable, never a raw stack trace
   return {
     icon: "⚠️",
     title: "Something Went Wrong",
@@ -236,72 +260,134 @@ export default function Home() {
   const [error, setError] = useState("");
   const [wsStatus, setWsStatus] = useState("Connecting WebSocket...");
   const [history, setHistory] = useState<ChatMessage[]>([]);
-
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
   const [latency, setLatency] = useState<LatencyInfo | null>(null);
-  const [cacheCounters, setCacheCounters] = useState<CacheCounters>({ hits: 0, misses: 0 });
 
-  const [currentUsage, setCurrentUsage] = useState<UsageStats | null>(null);
+  const [currentUsage, setCurrentUsage] =
+    useState<UsageStats | null>(null);
+
   const [totalUsage, setTotalUsage] = useState<UsageStats>({
     promptTokens: 0,
     completionTokens: 0,
     totalTokens: 0,
   });
 
-  // Request cancellation
-  const abortRef = useRef<AbortController | null>(null);
+  // Synchronous request ownership prevents overlapping requests.
+  const activeRequestRef = useRef<ActiveRequest | null>(null);
+  const requestIdRef = useRef(0);
 
-  // Holds the full streamed answer without a React re-render per chunk;
-  // the UI is flushed once per animation frame instead.
   const streamedAnswerRef = useRef("");
   const animationFrameRef = useRef<number | null>(null);
 
-  // ----------------------------------------------------------
-  // Batched answer rendering
-  // ----------------------------------------------------------
+  // ============================================================
+  // Request ownership / rendering helpers
+  // ============================================================
 
-  function scheduleAnswerUpdate() {
-    if (animationFrameRef.current !== null) return;
-
-    animationFrameRef.current = requestAnimationFrame(() => {
-      animationFrameRef.current = null;
-      setAnswer(streamedAnswerRef.current);
-    });
+  function isCurrentRequest(request: ActiveRequest): boolean {
+    return (
+      activeRequestRef.current === request &&
+      !request.cancelled &&
+      !request.controller.signal.aborted
+    );
   }
 
-  function flushAnswerUpdate() {
+  function cancelAnswerFrame() {
     if (animationFrameRef.current !== null) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
     }
+  }
+
+  function scheduleAnswerUpdate(request: ActiveRequest) {
+    if (!isCurrentRequest(request)) return;
+    if (animationFrameRef.current !== null) return;
+
+    animationFrameRef.current = requestAnimationFrame(() => {
+      animationFrameRef.current = null;
+
+      if (!isCurrentRequest(request)) return;
+
+      setAnswer(streamedAnswerRef.current);
+    });
+  }
+
+  function flushAnswerUpdate(request: ActiveRequest) {
+    if (!isCurrentRequest(request)) return;
+
+    cancelAnswerFrame();
     setAnswer(streamedAnswerRef.current);
   }
 
-  // ----------------------------------------------------------
+  // ============================================================
+  // Cancel active request
+  // ============================================================
+
+  function cancelActiveRequest(preservePartialAnswer: boolean) {
+    const request = activeRequestRef.current;
+
+    if (!request) return;
+
+    // Invalidate ownership before aborting. Old async callbacks
+    // cannot update the UI or affect a new request.
+    request.cancelled = true;
+    activeRequestRef.current = null;
+
+    console.log(`[assist:${request.id}] cancellation requested`);
+
+    request.controller.abort();
+
+    if (request.reader) {
+      void request.reader.cancel().catch(() => {
+        // The stream may already be closed or errored.
+      });
+    }
+
+    cancelAnswerFrame();
+
+    if (preservePartialAnswer) {
+      setAnswer(streamedAnswerRef.current);
+    } else {
+      streamedAnswerRef.current = "";
+      setAnswer("");
+    }
+
+    setLoading(false);
+  }
+
+  // ============================================================
   // Cleanup on unmount
-  // ----------------------------------------------------------
+  // ============================================================
 
   useEffect(() => {
     return () => {
-      abortRef.current?.abort();
-      abortRef.current = null;
+      const request = activeRequestRef.current;
 
-      if (animationFrameRef.current !== null) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
+      if (request) {
+        request.cancelled = true;
+        activeRequestRef.current = null;
+
+        request.controller.abort();
+
+        if (request.reader) {
+          void request.reader.cancel().catch(() => {});
+        }
       }
+
+      cancelAnswerFrame();
     };
   }, []);
 
-  // ----------------------------------------------------------
+  // ============================================================
   // WebSocket status
-  // ----------------------------------------------------------
+  // ============================================================
 
   useEffect(() => {
     let ws: WebSocket | null = null;
 
     try {
-      const wsUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:5000";
+      const wsUrl =
+        process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:5000";
+
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => setWsStatus("WebSocket Connected");
@@ -309,7 +395,10 @@ export default function Home() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.type === "status") console.log("WebSocket status:", data.message);
+
+          if (data.type === "status") {
+            console.log("WebSocket status:", data.message);
+          }
         } catch {
           // Ignore invalid WebSocket messages.
         }
@@ -318,19 +407,18 @@ export default function Home() {
       ws.onerror = () => setWsStatus("WebSocket Standby");
       ws.onclose = () => setWsStatus("WebSocket Standby");
     } catch {
-      // Deferred so the effect body itself stays free of synchronous setState.
       queueMicrotask(() => setWsStatus("WebSocket Standby"));
     }
 
     return () => ws?.close();
   }, []);
 
-  // ----------------------------------------------------------
+  // ============================================================
   // Main AI request
-  // ----------------------------------------------------------
+  // ============================================================
 
   async function runSearch(e?: FormEvent) {
-    if (e) e.preventDefault();
+    e?.preventDefault();
 
     const q = query.trim();
 
@@ -338,7 +426,18 @@ export default function Home() {
       setError("Please enter a question first.");
       return;
     }
-    if (loading) return;
+
+    // Ref guard works synchronously, unlike the loading state.
+    if (activeRequestRef.current) return;
+
+    const request: ActiveRequest = {
+      id: ++requestIdRef.current,
+      controller: new AbortController(),
+      reader: null,
+      cancelled: false,
+    };
+
+    activeRequestRef.current = request;
 
     setLoading(true);
     setError("");
@@ -346,74 +445,136 @@ export default function Home() {
     setModel("");
     setCacheInfo(null);
     setLatency(null);
+    setCurrentUsage(null);
 
     streamedAnswerRef.current = "";
-    const controller = new AbortController();
-    abortRef.current = controller;
 
     const startedAt = performance.now();
     let chunkCount = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
-    console.log(`[assist] → POST /api/assist "${q}"`);
+    console.log(`[assist:${request.id}] → POST /api/assist`);
 
     try {
+      const requestHistory = history.slice(-MAX_HISTORY_ITEMS);
+
+      console.log(
+        `[assist:${request.id}] history: ${requestHistory.length} messages`
+      );
+
       const res = await fetch("/api/assist", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q, history }),
-        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          query: q,
+          history: requestHistory,
+        }),
+        signal: request.controller.signal,
       });
+
+      if (!isCurrentRequest(request)) return;
 
       if (!res.ok || !res.body) {
         const raw = await res.text().catch(() => "");
-        throw new Error(extractErrorMessage(raw) || `Request failed (${res.status})`);
+
+        if (!isCurrentRequest(request)) return;
+
+        throw new Error(
+          extractErrorMessage(raw) || `Request failed (${res.status})`
+        );
       }
 
-      // ---- Response metadata: cache status, provider, latency, tool ----
+      // Response metadata
       const providerName = res.headers.get("x-provider") || "";
       const providerModel = res.headers.get("x-model") || "";
       const cacheLayer = res.headers.get("x-cache") || "MISS";
       const toolName = res.headers.get("x-tool");
-      const timing = parseServerTiming(res.headers.get("server-timing"));
+      const timing = parseServerTiming(
+        res.headers.get("server-timing")
+      );
 
-      setModel(providerModel ? `${providerName} · ${providerModel}` : providerName);
-      setCacheInfo({ layer: cacheLayer, hit: isCacheHit(cacheLayer), tool: toolName });
+      if (!isCurrentRequest(request)) return;
 
-      // ---- Stream tokens ----
-      const reader = res.body.getReader();
+      setModel(
+        providerModel ? `${providerName} · ${providerModel}` : providerName
+      );
+
+      setCacheInfo({
+        layer: cacheLayer,
+        provider: providerName,
+        hit: isCacheHit(cacheLayer),
+        tool: toolName,
+      });
+
+      // Stream tokens
+      reader = res.body.getReader();
+      request.reader = reader;
+
       const decoder = new TextDecoder();
       const STREAM_ERROR_PREFIX = "__OPSMATE_STREAM_ERROR__:";
 
       while (true) {
         const { done, value } = await reader.read();
+
+        // Stop may happen while reader.read() is pending.
+        if (!isCurrentRequest(request)) return;
+
         if (done) break;
 
         const delta = decoder.decode(value, { stream: true });
+
         if (!delta) continue;
 
         if (delta.includes(STREAM_ERROR_PREFIX)) {
-          const friendlyMessage = delta.split(STREAM_ERROR_PREFIX)[1]?.trim();
+          const friendlyMessage = delta
+            .split(STREAM_ERROR_PREFIX)[1]
+            ?.trim();
+
+          if (!isCurrentRequest(request)) return;
 
           streamedAnswerRef.current = "";
-          flushAnswerUpdate();
+          cancelAnswerFrame();
+
+          setAnswer("");
           setModel("");
           setCacheInfo(null);
           setLatency(null);
           setCurrentUsage(null);
+
           setError(
-            friendlyMessage || "Something went wrong while getting a response. Please try again."
+            friendlyMessage ||
+              "Something went wrong while getting a response. Please try again."
           );
 
-          console.error("[assist] provider error:", friendlyMessage);
+          console.error(
+            `[assist:${request.id}] provider error:`,
+            friendlyMessage
+          );
+
           return;
         }
 
         streamedAnswerRef.current += delta;
         chunkCount++;
-        scheduleAnswerUpdate();
+
+        scheduleAnswerUpdate(request);
       }
 
-      flushAnswerUpdate();
+      // Flush any incomplete UTF-8 characters left in the decoder.
+      const decoderTail = decoder.decode();
+
+      if (!isCurrentRequest(request)) return;
+
+      if (decoderTail) {
+        streamedAnswerRef.current += decoderTail;
+      }
+
+      // Only a normally completed stream reaches this section.
+      if (!isCurrentRequest(request)) return;
+
+      flushAnswerUpdate(request);
 
       const finalAnswer = streamedAnswerRef.current;
       const totalMs = Math.round(performance.now() - startedAt);
@@ -424,18 +585,20 @@ export default function Home() {
         totalMs,
       });
 
-      const hit = isCacheHit(cacheLayer);
-      setCacheCounters((prev) =>
-        hit ? { ...prev, hits: prev.hits + 1 } : { ...prev, misses: prev.misses + 1 }
-      );
-
       console.log(
-        `[assist] ← ${cacheLayer} | ${chunkCount} chunks | ${finalAnswer.length} chars | ${totalMs}ms`
+        `[assist:${request.id}] ← ${cacheLayer} (${providerName}) | ${chunkCount} chunks | ${finalAnswer.length} chars | ${totalMs}ms`
       );
 
-      // ---- Token usage (estimated client-side) ----
-      const historyCharacters = history.reduce((total, m) => total + m.content.length, 0);
-      const promptEstimate = Math.ceil((q.length + historyCharacters) / 4);
+      // Estimated token usage
+      const historyCharacters = requestHistory.reduce(
+        (total, message) => total + message.content.length,
+        0
+      );
+
+      const promptEstimate = Math.ceil(
+        (q.length + historyCharacters) / 4
+      );
+
       const completionEstimate = Math.ceil(finalAnswer.length / 4);
 
       const usage: UsageStats = {
@@ -444,93 +607,129 @@ export default function Home() {
         totalTokens: promptEstimate + completionEstimate,
       };
 
+      if (!isCurrentRequest(request)) return;
+
       setCurrentUsage(usage);
+
       setTotalUsage((prev) => ({
         promptTokens: prev.promptTokens + usage.promptTokens,
         completionTokens: prev.completionTokens + usage.completionTokens,
         totalTokens: prev.totalTokens + usage.totalTokens,
       }));
 
-      // ---- Conversation history ----
-      setHistory((prev) => [
-        ...prev,
+      // Save history only after successful stream completion.
+      const completedTurn: ChatMessage[] = [
         { role: "user", content: q },
-        { role: "assistant", content: finalAnswer || "(empty response)" },
-      ]);
+        {
+          role: "assistant",
+          content: finalAnswer || "(empty response)",
+        },
+      ];
+
+      if (!isCurrentRequest(request)) return;
+
+      setHistory((prev) =>
+        [...prev, ...completedTurn].slice(-MAX_HISTORY_ITEMS)
+      );
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        console.log("[assist] ⛔ request aborted by user");
-      } else {
-        setError(err instanceof Error ? err.message : "Something went wrong");
+      // An old/cancelled request must not touch current UI state.
+      if (!isCurrentRequest(request)) {
+        console.log(`[assist:${request.id}] cancelled request ignored`);
+        return;
       }
+
+      if (
+        request.controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        console.log(`[assist:${request.id}] request aborted`);
+        return;
+      }
+
+      setError(
+        err instanceof Error ? err.message : "Something went wrong"
+      );
     } finally {
-      abortRef.current = null;
-      setLoading(false);
+      if (reader) {
+        // releaseLock can throw if a read is still pending.
+        try {
+          reader.releaseLock();
+        } catch {
+          // The reader may already be released or still have a pending read.
+        }
+      }
+
+      // An old request must never clear a newer request's state.
+      if (activeRequestRef.current === request) {
+        activeRequestRef.current = null;
+        setLoading(false);
+      }
+
+      console.log(`[assist:${request.id}] request cleanup completed`);
     }
   }
 
-  // ----------------------------------------------------------
+  // ============================================================
   // Stop / reset
-  // ----------------------------------------------------------
+  // ============================================================
 
   function stopResponse() {
-    if (!abortRef.current) return;
-    console.log("[assist] 🛑 stop requested — cancelling stream");
-    abortRef.current.abort();
+    cancelActiveRequest(true);
   }
 
   function resetSession() {
-    abortRef.current?.abort();
-    abortRef.current = null;
+    cancelActiveRequest(false);
 
-    if (animationFrameRef.current !== null) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
+    cancelAnswerFrame();
 
     streamedAnswerRef.current = "";
+
     setHistory([]);
     setCurrentUsage(null);
-    setTotalUsage({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+
+    setTotalUsage({
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    });
+
     setCacheInfo(null);
     setLatency(null);
-    setCacheCounters({ hits: 0, misses: 0 });
+
     setAnswer("");
     setQuery("");
     setError("");
     setModel("");
   }
 
-  const totalQueries = cacheCounters.hits + cacheCounters.misses;
-  const hitRate =
-    totalQueries > 0 ? Math.round((cacheCounters.hits / totalQueries) * 100) : 0;
-
-  // ----------------------------------------------------------
+  // ============================================================
   // UI
-  // ----------------------------------------------------------
+  // ============================================================
 
   return (
     <main className="page">
       <div className="shell">
-        {/* ================= HEADER ================= */}
         <header className="header">
           <div className="header-top">
             <div className="brand-group">
               <p className="brand">OpsMate</p>
 
-              <span className={`ws-badge ${wsStatus.includes("Connected") ? "connected" : ""}`}>
+              <span
+                className={`ws-badge ${
+                  wsStatus.includes("Connected") ? "connected" : ""
+                }`}
+              >
                 ● {wsStatus}
               </span>
 
-              {totalQueries > 0 && (
-                <span className="cache-badge stats" title="Session cache hit rate">
-                  ⚡ {cacheCounters.hits}/{totalQueries} cache hits ({hitRate}%)
-                </span>
-              )}
             </div>
 
-            {history.length > 0 && (
-              <button type="button" onClick={resetSession} className="reset-btn">
+            {(history.length > 0 || activeRequestRef.current) && (
+              <button
+                type="button"
+                onClick={resetSession}
+                className="reset-btn"
+              >
                 Reset Context
               </button>
             )}
@@ -539,12 +738,17 @@ export default function Home() {
           <h1>Test the AI model</h1>
 
           <p className="sub">
-            Ask anything — cached answers return instantly, everything else streams from the
-            fastest healthy provider.
+            Ask anything — cached answers return instantly, everything else
+            streams from the fastest healthy provider.
+          </p>
+
+          <p className="sub">
+            Conversation history: last {history.length / 2} of{" "}
+            {MAX_HISTORY_MESSAGES} turns retained.
           </p>
         </header>
 
-        {/* ================= SEARCH ================= */}
+        {/* Search */}
         <form className="search" onSubmit={runSearch}>
           <label htmlFor="q" className="sr-only">
             Search
@@ -579,7 +783,7 @@ export default function Home() {
           )}
         </form>
 
-        {/* ================= LOADING ================= */}
+        {/* Loading */}
         {loading && (
           <div className="loading-card" aria-live="polite">
             <div className="loading-spinner" />
@@ -587,13 +791,17 @@ export default function Home() {
           </div>
         )}
 
-        {/* ================= ERROR ================= */}
+        {/* Error */}
         {error &&
           (() => {
             const { icon, title, body } = parseErrorInfo(error);
 
             return (
-              <div className="error-card" role="alert" aria-live="assertive">
+              <div
+                className="error-card"
+                role="alert"
+                aria-live="assertive"
+              >
                 <div className="error-card-header">
                   <span className="error-card-icon" aria-hidden="true">
                     {icon}
@@ -603,26 +811,39 @@ export default function Home() {
 
                 <p className="error-card-body">{body}</p>
 
-                <button type="button" className="error-card-retry" onClick={() => runSearch()}>
+                <button
+                  type="button"
+                  className="error-card-retry"
+                  onClick={() => runSearch()}
+                >
                   🔄 Try Again
                 </button>
               </div>
             );
           })()}
 
-        {/* ================= RESULT ================= */}
+        {/* Result */}
         {answer && (
           <section className="result" aria-live="polite">
             <div className="result-meta">
               {cacheInfo && (
-                <span className={`cache-badge ${cacheInfo.hit ? "hit" : "miss"}`}>
+                <span
+                  className={`cache-badge ${
+                    cacheInfo.hit ? "hit" : "miss"
+                  }`}
+                >
                   {cacheInfo.hit ? "⚡ Cache HIT" : "❄ Cache MISS"}
-                  <span className="badge-detail">· {cacheLayerLabel(cacheInfo.layer)}</span>
+                  <span className="badge-detail">
+                    · {cacheProviderLabel(cacheInfo.provider)}
+                  </span>
                 </span>
               )}
 
               {cacheInfo?.tool && (
-                <span className="meta-chip" title="The assistant called a tool to answer this">
+                <span
+                  className="meta-chip"
+                  title="The assistant called a tool to answer this"
+                >
                   🔧 {cacheInfo.tool}
                 </span>
               )}
@@ -640,7 +861,7 @@ export default function Home() {
           </section>
         )}
 
-        {/* ================= CONTEXT USAGE ================= */}
+        {/* Context usage */}
         {currentUsage && (
           <section className="context-usage" aria-label="Context Usage">
             <h2>📊 Context Usage</h2>
@@ -652,12 +873,16 @@ export default function Home() {
                   <h3>Current Request Context</h3>
                 </div>
 
-                <p className="description">Tokens used in the latest API request</p>
+                <p className="description">
+                  Estimated tokens for the latest request
+                </p>
 
                 <div className="token-metrics">
                   <div className="metric">
                     <span className="label">Prompt (Input):</span>
-                    <span className="value">{currentUsage.promptTokens.toLocaleString()} tokens</span>
+                    <span className="value">
+                      {currentUsage.promptTokens.toLocaleString()} tokens
+                    </span>
                   </div>
 
                   <div className="metric">
@@ -669,7 +894,9 @@ export default function Home() {
 
                   <div className="metric total">
                     <span className="label">Current Request Total:</span>
-                    <span className="value">{currentUsage.totalTokens.toLocaleString()} tokens</span>
+                    <span className="value">
+                      {currentUsage.totalTokens.toLocaleString()} tokens
+                    </span>
                   </div>
                 </div>
               </div>
@@ -680,12 +907,16 @@ export default function Home() {
                   <h3>Total Context (Accumulated)</h3>
                 </div>
 
-                <p className="description">Total tokens consumed across all turns</p>
+                <p className="description">
+                  Estimated tokens across requests in this session
+                </p>
 
                 <div className="token-metrics">
                   <div className="metric">
                     <span className="label">Total Prompt Tokens:</span>
-                    <span className="value">{totalUsage.promptTokens.toLocaleString()} tokens</span>
+                    <span className="value">
+                      {totalUsage.promptTokens.toLocaleString()} tokens
+                    </span>
                   </div>
 
                   <div className="metric">
@@ -697,7 +928,9 @@ export default function Home() {
 
                   <div className="metric total">
                     <span className="label">Total Accumulated Context:</span>
-                    <span className="value">{totalUsage.totalTokens.toLocaleString()} tokens</span>
+                    <span className="value">
+                      {totalUsage.totalTokens.toLocaleString()} tokens
+                    </span>
                   </div>
                 </div>
               </div>
