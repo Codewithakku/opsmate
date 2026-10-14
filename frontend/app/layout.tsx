@@ -14,7 +14,8 @@ const display = Fraunces({
 
 export const metadata: Metadata = {
   title: "OpsMate — AI Search",
-  description: "Test AI search via OpsMate backend and Supabase",
+  description:
+    "OpsMate e-commerce support assistant — local Ollama model with a PostgreSQL answer cache",
 };
 
 export default function RootLayout({

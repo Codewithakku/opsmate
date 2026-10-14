@@ -134,8 +134,24 @@ async function handleAssist(
       detail.slice(0, 200)
     );
 
+    // Backend errors are JSON ({ message, title, code, ... }). Extract the
+    // human message so raw JSON never reaches the browser.
+    let message = detail;
+
+    try {
+      const parsed = JSON.parse(detail);
+
+      if (typeof parsed === "string") {
+        message = parsed;
+      } else if (parsed?.message || parsed?.error) {
+        message = String(parsed.message || parsed.error);
+      }
+    } catch {
+      // Plain-text body; use it as-is.
+    }
+
     return errorStream(
-      detail || `The backend failed to answer (HTTP ${backend.status}).`,
+      message || `The backend failed to answer (HTTP ${backend.status}).`,
       {
         "X-Cache": "ERROR",
       }
@@ -163,13 +179,10 @@ async function handleAssist(
   // cancels the upstream request and releases the reader lock.
   const backendReader = backend.body.getReader();
 
-  let streamFinished = false;
-
   const outputStream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         if (upstreamController.signal.aborted) {
-          streamFinished = true;
           controller.close();
           return;
         }
@@ -177,13 +190,11 @@ async function handleAssist(
         const { done, value } = await backendReader.read();
 
         if (upstreamController.signal.aborted) {
-          streamFinished = true;
           controller.close();
           return;
         }
 
         if (done) {
-          streamFinished = true;
           request.signal.removeEventListener("abort", abortUpstream);
 
           try {
@@ -200,7 +211,6 @@ async function handleAssist(
           controller.enqueue(value);
         }
       } catch (error) {
-        streamFinished = true;
         request.signal.removeEventListener("abort", abortUpstream);
 
         try {
@@ -212,8 +222,6 @@ async function handleAssist(
     },
 
     async cancel(reason) {
-      streamFinished = true;
-
       request.signal.removeEventListener("abort", abortUpstream);
 
       if (!upstreamController.signal.aborted) {
