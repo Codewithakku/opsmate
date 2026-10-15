@@ -610,3 +610,154 @@ input {
     align-items: flex-start;
   }
 }
+
+/* Live pipeline trace */
+
+.trace-panel {
+  margin-top: 1.25rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1rem 1.2rem 0.85rem;
+  min-width: 0;
+}
+
+.trace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.trace-header h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.trace-state {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.trace-state.live {
+  color: var(--accent);
+}
+
+.trace-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.trace-step {
+  display: grid;
+  grid-template-columns: 10px 76px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0.65rem;
+  padding: 0.42rem 0;
+  border-top: 1px dashed #e8eef1;
+  font-size: 0.86rem;
+  line-height: 1.35;
+}
+
+.trace-step:first-child {
+  border-top: none;
+}
+
+/* Anchored to the FIRST line of the step, so a wrapped detail line never
+   drags the dot down the row. */
+.trace-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  align-self: start;
+  margin-top: 0.33rem;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
+}
+
+.trace-stage {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.trace-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.trace-title {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.trace-detail {
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.trace-detail::before {
+  content: "·";
+  margin-right: 0.35rem;
+  color: #cbd5e1;
+}
+
+.trace-ms {
+  font-size: 0.74rem;
+  color: #94a3b8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Per-stage accent, so a glance shows WHICH kind of step ran */
+.trace-step.understand .trace-dot { background: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12); }
+.trace-step.route .trace-dot      { background: #6366f1; box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12); }
+.trace-step.cache .trace-dot      { background: #d97706; box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12); }
+.trace-step.tool .trace-dot       { background: #0ea5e9; box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.12); }
+.trace-step.answer .trace-dot     { background: #16a34a; box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.12); }
+.trace-step.done .trace-dot       { background: #475569; box-shadow: 0 0 0 3px rgba(71, 85, 105, 0.12); }
+
+/* Status overrides the stage colour: skipped/gray, failed/red, running/pulses */
+.trace-step.skip .trace-dot {
+  background: #94a3b8;
+  box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.14);
+}
+
+.trace-step.error .trace-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(180, 35, 24, 0.14);
+}
+
+.trace-step.error .trace-title {
+  color: var(--danger);
+}
+
+.trace-step.run .trace-dot,
+.trace-step.pending .trace-dot {
+  animation: trace-pulse 1s ease-in-out infinite;
+}
+
+@keyframes trace-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.4; transform: scale(0.75); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-step.run .trace-dot,
+  .trace-step.pending .trace-dot {
+    animation: none;
+  }
+}
+

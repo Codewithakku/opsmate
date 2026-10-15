@@ -30,6 +30,36 @@ Pressing **■ Stop** aborts the browser fetch; the Next proxy drops the connect
 `res.on("close")` handler aborts the Ollama request, and a partially generated answer is **never
 written to `query_cache`**. Server logs show `[Assist] client disconnected … cancelling generation`.
 
+### Pipeline trace (console + UI)
+
+Every question moves through a staged pipeline and each stage is reported **twice**: once as one
+numbered console line, and once as a trace event streamed to the UI, which renders the same steps
+live while the answer is still being generated.
+
+```
+[7eec] 1 ✓ understand Query understood  ·  support question · no order id
+[7eec] 2 ⏭ cache      Cache miss  ·  generating with the model
+[7eec] 3 ▸ tool       Tool selected by the model  ·  get_order
+[7eec] 4 ▸ tool       Calling get_order  ·  order_id=ORD-1001
+[7eec] 5 ✓ tool       get_order returned  ·  ORD-1001 · shipped · 2 item(s)
+[7eec] 6 ▸ answer     Answer streaming  ·  llama3.2:3b · first token 420ms
+[7eec] 7 ✓ cache      Answer cached  ·  query_cache · ttl 86400s
+[7eec] 8 ✓ done       Answered from MISS  ·  116 char(s) · tool get_order
+```
+
+Stages: `understand` → `route` / `cache` → `tool` (selection, call and result, repeated for every
+tool the model asks for) → `answer` → `done`, plus `error` when a step fails. The tracer lives in
+`backend/trace.js`; the standalone MCP server (`mcp/index.js`) logs one staged line per tool call
+on **stderr** (stdout carries the JSON-RPC protocol there, so nothing may be logged to it).
+
+On the wire the steps ride along inside the assist stream as `__OPSMATE_TRACE__:{json}` lines, so
+the UI can show the pipeline before the first token arrives; `frontend/lib/stream-parser.ts`
+parses them (chunk-boundary behavior is covered by `npm test` in `frontend/`).
+
+- `TRACE_STREAM=false` — keep the trace in the server console only (no trace events in the stream).
+- `LOG_VERBOSE=true` — bring back the detailed per-layer `[Cache] …` lines. They are off by default
+  because the staged trace already reports every cache decision in one line.
+
 ## Run modes
 
 ### Local dev (npm)
@@ -103,6 +133,8 @@ Cache rules:
 | `CACHE_L1_TTL_SEC` / `CACHE_TTL_SEC` / `CACHE_LIVE_TTL_SEC` | `300` / `86400` / `60` | Cache lifetimes |
 | `CACHE_DB_TIMEOUT_MS` | `8000` | Postgres cache I/O ceiling |
 | `ORDER_FAST_PATH` | `true` | Answer status questions from the DB without the LLM |
+| `TRACE_STREAM` | `true` | Stream pipeline trace events to the UI (`false` = server console only) |
+| `LOG_VERBOSE` | `false` | Detailed per-layer `[Cache]` logging (the staged trace covers it by default) |
 
 Retired keys (`ANTHROPIC_*`, `GEMINI_*`, `OPENAI_*`, `SUPABASE_*`, `UPSTASH_*`) are commented out
 in `.env`, `backend/.env` and `frontend/.env.local`.

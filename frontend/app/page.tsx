@@ -10,6 +10,13 @@ import {
   useState,
 } from "react";
 
+import {
+  StreamMarkerParser,
+  type StreamMeta,
+  type StreamParseResult,
+  type TraceStep,
+} from "@/lib/stream-parser";
+
 // ============================================================
 // Types
 // ============================================================
@@ -30,13 +37,6 @@ interface CacheInfo {
   provider: string;
   hit: boolean;
   tool: string | null;
-  embeddingStatus: string | null;
-  semanticStatus: string | null;
-  similarity: number | null;
-}
-
-interface StreamMeta {
-  layer: string;
   embeddingStatus: string | null;
   semanticStatus: string | null;
   similarity: number | null;
@@ -183,130 +183,24 @@ function parseServerTiming(
 }
 
 // ============================================================
-// Streaming marker parser
+// Live pipeline trace
 //
-// The backend rides status information along with the answer text
-// (`__OPSMATE_STREAM_META__:` / `__OPSMATE_STREAM_ERROR__:`). A chunk boundary
-// can fall anywhere — even inside a marker or its payload — so a single chunk
-// can never be judged on its own: text is only safe to display once it can no
-// longer be the start of a marker, and a marker is only acted on once the
-// stream has ended (both markers always trail the answer).
+// Every step the backend takes (query understood -> cache/tool decision ->
+// model answer -> done) arrives as a trace event inside the answer stream and
+// is rendered as a timeline, so the pipeline is visible WHILE it runs instead
+// of only as a final result. Parsing lives in lib/stream-parser.ts.
 // ============================================================
 
-// [stream-marker-parser]
-const STREAM_ERROR_PREFIX = "__OPSMATE_STREAM_ERROR__:";
-const STREAM_META_PREFIX = "__OPSMATE_STREAM_META__:";
-
-const STREAM_MARKERS = [STREAM_ERROR_PREFIX, STREAM_META_PREFIX];
-
-interface StreamParseResult {
-  text: string;
-  meta: StreamMeta | null;
-  error: string | null;
-}
-
-// First complete marker in `text`, if any.
-function findStreamMarker(
-  text: string
-): { index: number; marker: string } | null {
-  let found: { index: number; marker: string } | null = null;
-
-  for (const marker of STREAM_MARKERS) {
-    const index = text.indexOf(marker);
-
-    if (index !== -1 && (found === null || index < found.index)) {
-      found = { index, marker };
-    }
-  }
-
-  return found;
-}
-
-// Length of the longest suffix of `text` that must stay buffered because it
-// could still turn out to be the beginning of a marker split across chunks.
-function heldBackLength(text: string): number {
-  let longest = 0;
-
-  for (const marker of STREAM_MARKERS) {
-    const max = Math.min(marker.length - 1, text.length);
-
-    for (let length = max; length > 0; length -= 1) {
-      if (text.endsWith(marker.slice(0, length))) {
-        if (length > longest) longest = length;
-        break;
-      }
-    }
-  }
-
-  return longest;
-}
-
-class StreamMarkerParser {
-  private buffer = "";
-  private marker: string | null = null;
-  private payload = "";
-
-  push(chunk: string): StreamParseResult {
-    const result: StreamParseResult = { text: "", meta: null, error: null };
-
-    // Already inside a marker payload: every further byte belongs to it.
-    if (this.marker !== null) {
-      this.payload += chunk;
-      return result;
-    }
-
-    this.buffer += chunk;
-
-    const hit = findStreamMarker(this.buffer);
-
-    if (hit) {
-      result.text = this.buffer.slice(0, hit.index);
-      this.marker = hit.marker;
-      this.payload = this.buffer.slice(hit.index + hit.marker.length);
-      this.buffer = "";
-      return result;
-    }
-
-    const hold = heldBackLength(this.buffer);
-
-    result.text = hold > 0 ? this.buffer.slice(0, this.buffer.length - hold) : this.buffer;
-    this.buffer = hold > 0 ? this.buffer.slice(this.buffer.length - hold) : "";
-
-    return result;
-  }
-
-  // Releases the buffered tail and interprets a marker that completed. Safe to
-  // call once the stream has ended (and only then).
-  finish(): StreamParseResult {
-    const result: StreamParseResult = { text: "", meta: null, error: null };
-
-    if (this.marker === null) {
-      result.text = this.buffer;
-      this.buffer = "";
-      return result;
-    }
-
-    const payload = this.payload.trim();
-
-    if (this.marker === STREAM_META_PREFIX) {
-      try {
-        result.meta = JSON.parse(payload) as StreamMeta;
-      } catch {
-        // Malformed metadata: keep whatever the response headers reported.
-      }
-    } else {
-      result.error =
-        payload ||
-        "Something went wrong while getting a response. Please try again.";
-    }
-
-    this.marker = null;
-    this.payload = "";
-
-    return result;
-  }
-}
-// [/stream-marker-parser]
+const TRACE_STAGE_LABELS: Record<string, string> = {
+  understand: "understand",
+  scope: "scope",
+  route: "route",
+  cache: "cache",
+  tool: "tool",
+  answer: "answer",
+  done: "done",
+  error: "error",
+};
 
 // ============================================================
 // Error handling
@@ -470,6 +364,7 @@ export default function Home() {
   const [latency, setLatency] = useState<LatencyInfo | null>(null);
   const [currentQuestion, setCurrentQuestion] = useState("");
   const [requestNumber, setRequestNumber] = useState<number | null>(null);
+  const [trace, setTrace] = useState<TraceStep[]>([]);
 
   const [currentUsage, setCurrentUsage] =
     useState<UsageStats | null>(null);
@@ -645,6 +540,7 @@ export default function Home() {
     setCacheInfo(null);
     setLatency(null);
     setCurrentUsage(null);
+    setTrace([]);
 
     streamedAnswerRef.current = "";
     streamMetaRef.current = null;
@@ -728,7 +624,12 @@ export default function Home() {
 
       const applyParsed = (parsed: StreamParseResult) => {
         appendAnswerText(parsed.text);
-        if (parsed.meta) streamMetaRef.current = parsed.meta;
+
+        // Trace steps arrive DURING the request and are appended as they land,
+        // so the pipeline renders live (meta/error only arrive at the end).
+        if (parsed.traces.length > 0) {
+          setTrace((prev) => [...prev, ...parsed.traces]);
+        }
       };
 
       while (true) {
@@ -778,13 +679,16 @@ export default function Home() {
 
       if (streamMetaRef.current) {
         const meta = streamMetaRef.current;
+        const metaLayer = meta.layer || headerLayer;
 
         setCacheInfo((prev) =>
           prev
             ? {
                 ...prev,
-                layer: meta.layer || prev.layer,
-                hit: isCacheHit(meta.layer || prev.layer),
+                layer: metaLayer,
+                hit: isCacheHit(metaLayer),
+                provider: meta.provider || prev.provider,
+                tool: meta.tool ?? prev.tool,
                 embeddingStatus:
                   meta.embeddingStatus ?? prev.embeddingStatus,
                 semanticStatus:
@@ -793,6 +697,13 @@ export default function Home() {
               }
             : prev
         );
+
+        // The provider/model badge is read from headers, but those were already
+        // flushed with the first trace line — the trailing meta marker is the
+        // authoritative value, so re-apply it here.
+        if (meta.provider || meta.model) {
+          setModel([meta.provider, meta.model].filter(Boolean).join(" · "));
+        }
       }
 
       const finalAnswer = streamedAnswerRef.current;
@@ -801,7 +712,9 @@ export default function Home() {
 
       setLatency({
         firstTokenMs: timing["first-token"] ?? null,
-        serverMs: timing["total"] ?? null,
+        // Headers may have been flushed before the timing existed (first trace
+        // line), in which case the trailing meta marker carries the server time.
+        serverMs: timing["total"] ?? streamMetaRef.current?.serverMs ?? null,
         totalMs,
       });
 
@@ -934,6 +847,7 @@ export default function Home() {
     setModel("");
     setCurrentQuestion("");
     setRequestNumber(null);
+    setTrace([]);
   }
 
   // ============================================================
@@ -1196,6 +1110,61 @@ export default function Home() {
             </div>
           )}
         </section>
+
+        {/* Live pipeline trace: which step is running right now */}
+        {trace.length > 0 && (
+          <section
+            className="trace-panel"
+            aria-live="polite"
+            aria-label="Pipeline trace"
+          >
+            <div className="trace-header">
+              <h2>🧭 Pipeline trace</h2>
+
+              <span className={`trace-state ${loading ? "live" : "done"}`}>
+                {loading ? "● live" : "● complete"}
+              </span>
+            </div>
+
+            <ol className="trace-list">
+              {trace.map((step) => (
+                <li
+                  key={`${step.n}-${step.stage}`}
+                  className={`trace-step ${step.stage} ${step.status}`}
+                >
+                  <span className="trace-dot" aria-hidden="true" />
+
+                  <span className="trace-stage">
+                    {TRACE_STAGE_LABELS[step.stage] ?? step.stage}
+                  </span>
+
+                  <span className="trace-text">
+                    <span className="trace-title">{step.title}</span>
+
+                    {step.detail && (
+                      <span className="trace-detail">{step.detail}</span>
+                    )}
+                  </span>
+
+                  <span className="trace-ms">
+                    {step.ms > 0 ? `${step.ms}ms` : ""}
+                  </span>
+                </li>
+              ))}
+
+              {loading && (
+                <li className="trace-step pending">
+                  <span className="trace-dot" aria-hidden="true" />
+                  <span className="trace-stage">…</span>
+                  <span className="trace-text">
+                    <span className="trace-title">Working…</span>
+                  </span>
+                  <span className="trace-ms" />
+                </li>
+              )}
+            </ol>
+          </section>
+        )}
 
         {/* Error */}
         {error &&
